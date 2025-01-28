@@ -365,6 +365,65 @@ class Agent(Module):
         )
 
         return output
+    
+    def infer_states_vfe(self, observations, empirical_prior, *, past_actions=None, qs_hist=None, mask=None):
+        """
+        Update approximate posterior over hidden states by solving variational inference problem, given an observation.
+
+        Parameters
+        ----------
+        observations: ``list`` or ``tuple`` of ints
+            The observation input. Each entry ``observation[m]`` stores one-hot vectors representing the observations for modality ``m``.
+        past_actions: ``list`` or ``tuple`` of ints
+            The action input. Each entry ``past_actions[f]`` stores indices (or one-hots?) representing the actions for control factor ``f``.
+        empirical_prior: ``list`` or ``tuple`` of ``jax.numpy.ndarray`` of dtype object
+            Empirical prior beliefs over hidden states. Depending on the inference algorithm chosen, the resulting ``empirical_prior`` variable may be a matrix (or list of matrices) 
+            of additional dimensions to encode extra conditioning variables like timepoint and policy.
+        Returns
+        ---------
+        qs: ``numpy.ndarray`` of dtype object
+            Posterior beliefs over hidden states. Depending on the inference algorithm chosen, the resulting ``qs`` variable will have additional sub-structure to reflect whether
+            beliefs are additionally conditioned on timepoint and policy.
+            For example, in case the ``self.inference_algo == 'MMP' `` indexing structure is policy->timepoint-->factor, so that 
+            ``qs[p_idx][t_idx][f_idx]`` refers to beliefs about marginal factor ``f_idx`` expected under policy ``p_idx`` 
+            at timepoint ``t_idx``.
+        """
+        if not self.onehot_obs:
+            o_vec = [nn.one_hot(o, self.num_obs[m]) for m, o in enumerate(observations)]
+        else:
+            o_vec = observations
+        
+        A = self.A
+        if mask is not None:
+            for i, m in enumerate(mask):
+                o_vec[i] = m * o_vec[i] + (1 - m) * jnp.ones_like(o_vec[i]) / self.num_obs[i]
+                A[i] = m * A[i] + (1 - m) * jnp.ones_like(A[i]) / self.num_obs[i]
+
+        infer_states = partial(
+            inference.update_posterior_states_vfe,
+            A_dependencies=self.A_dependencies,
+            B_dependencies=self.B_dependencies,
+            num_iter=self.num_iter,
+            method=self.inference_algo
+        )
+        
+        output, err, vfe, S_Hqs, bs, un = vmap(infer_states)(  #output, err, vfe, kld, bs, un 
+            A,
+            self.B,
+            o_vec,
+            past_actions,
+            prior=empirical_prior,
+            qs_hist=qs_hist
+        )
+        #vfe=vfe[0].sum(2)
+        vfe=jtu.tree_map(lambda x: x.sum(2),vfe)
+        err=jtu.tree_map(lambda x: x.sum(2),err)
+        S_Hqs=jtu.tree_map(lambda x: x.sum(2),S_Hqs)
+        #kld=jtu.tree_map(lambda x: x.sum(2),kld)
+        bs=jtu.tree_map(lambda x: x.sum(2),bs)
+        un=jtu.tree_map(lambda x: x.sum(2),un)
+
+        return output, err, vfe, S_Hqs, bs, un#output, err, vfe, kld(S_Hqs)(po), bs, un
 
     def update_empirical_prior(self, action, qs):
         # return empirical_prior, and the history of posterior beliefs (filtering distributions) held about hidden states at times 1, 2 ... t
@@ -421,6 +480,48 @@ class Agent(Module):
         )
 
         return q_pi, G
+    
+    def infer_policies_detail(self, qs: List):
+        """
+        more detail breakdown of expected free energy than original infer_policies function
+
+        Returns
+        ----------
+        q_pi: 1D ``numpy.ndarray``
+            Posterior beliefs over policies, i.e. a vector containing one posterior probability per policy.
+        G: 1D ``numpy.ndarray``
+            Negative expected free energies of each policy, i.e. a vector containing one negative expected free energy per policy.
+        info: 1D ``dict``
+            details of expected free energies, {"state_info_gain":info_gain, "utility":utility, "pA_info_gain":pA_info_gain, "pB_info_gain":pB_info_gain, "inductive_value":inductive_value}
+            G(above) = info_gain + utility - (pA_info_gain + pB_info_gain) + inductive_value
+        """
+
+        latest_belief = jtu.tree_map(lambda x: x[:, -1], qs) # only get the posterior belief held at the current timepoint
+        infer_policies = partial(
+            control.update_posterior_policies_inductive_detail,
+            self.policies,
+            A_dependencies=self.A_dependencies,
+            B_dependencies=self.B_dependencies,
+            use_utility=self.use_utility,
+            use_states_info_gain=self.use_states_info_gain,
+            use_param_info_gain=self.use_param_info_gain,
+            use_inductive=self.use_inductive
+        )
+
+        q_pi, G, info = vmap(infer_policies)(
+            latest_belief, 
+            self.A,
+            self.B,
+            self.C,
+            self.E,
+            self.pA,
+            self.pB,
+            I = self.I,
+            gamma=self.gamma,
+            inductive_epsilon=self.inductive_epsilon
+        )
+
+        return q_pi, G, info
     
     def multiaction_probabilities(self, q_pi: Array):
         """
